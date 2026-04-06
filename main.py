@@ -2,62 +2,135 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import time
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# Configurar headers para simular un navegador
-headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-}
+# Configuración básica de logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Lista para almacenar todas las ofertas
-todos_los_trabajos = []
+class ScraperManager:
+    """
+    Gestiona la sesión de red, las peticiones HTTP y el sistema de reintentos.
+    """
+    def __init__(self, base_headers=None):
+        self.session = requests.Session()
+        self.headers = base_headers or {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        self.session.headers.update(self.headers)
 
-# Iterar sobre las páginas (1 a 20) pero detenerse si no hay más páginas
-for pagina in range(1, 21):
-    #url = f"https://mx.computrabajo.com/trabajo-de-jr-en-remoto?p={pagina}"
-    url = f"https://mx.computrabajo.com/trabajo-de-programador-en-remoto?p={pagina}"
-    #url = f"https://mx.computrabajo.com/trabajo-de-auxiliar-en-remoto?p={pagina}"
-    print(f"Extrayendo datos de la página {pagina}...")
-    
-    response = requests.get(url, headers=headers)
-    
-    # Verificar si la página no existe (404) o hay otro error
-    if response.status_code == 404:
-        print(f"🚨 No existe la página {pagina}. Terminando extracción.")
-        break  # Salir del bucle si la página no existe
-    elif response.status_code != 200:
-        print(f"⚠️ Error en la página {pagina}: Código {response.status_code}. Continuando...")
-        continue  # Saltar esta página pero seguir con la siguiente
-    
-    soup = BeautifulSoup(response.text, 'html.parser')
-    
-    # Extraer información de cada oferta (ajusta según la estructura HTML actual)
-    ofertas = soup.find_all('article', class_='box_offer')  # Clase puede variar
-    
-    # Si no hay ofertas en la página, terminar
-    if not ofertas:
-        print(f"📭 No se encontraron ofertas en la página {pagina}. Terminando extracción.")
-        break
-    
-    for oferta in ofertas:
-        titulo = oferta.find('h2', class_='fs18').text.strip() if oferta.find('h2', class_='fs18') else "Sin título"
-        empresa = oferta.find('p', class_='fs16').text.strip() if oferta.find('p', class_='fs16') else "Sin empresa"
-        ubicacion = oferta.find('span', class_='fs13').text.strip() if oferta.find('span', class_='fs13') else "Sin ubicación"
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((requests.exceptions.RequestException, requests.exceptions.HTTPError)),
+        before_sleep=lambda retry_state: logger.info(f"Reintentando... (Intento {retry_state.attempt_number})")
+    )
+    def fetch_page(self, url):
+        """
+        Realiza una petición GET con lógica de reintento exponencial (tenacity).
+        """
+        response = self.session.get(url, timeout=10)
         
-        if(empresa.find('BairesDev') == -1):
-            todos_los_trabajos.append({
-                "Página": pagina,
-                "Título": titulo,
-                "Empresa": empresa,
-                "Ubicación": ubicacion
-            })
-    
-    # Espera 2 segundos entre páginas para evitar bloqueos
-    time.sleep(2)
+        # Lanzar excepción para códigos 4xx o 5xx (excepto 404 para manejo controlado)
+        if response.status_code == 429:
+            logger.warning("Rímite de peticiones alcanzado (429).")
+            response.raise_for_status()
+        
+        if response.status_code == 404:
+            return None
+        
+        response.raise_for_status()
+        return response.text
 
-# Guardar los datos recolectados (si hay resultados)
-if todos_los_trabajos:
-    df = pd.DataFrame(todos_los_trabajos)
-    df.to_csv('ofertas_programador_paginacion.csv', index=False)
-    print(f"✅ Datos guardados en 'ofertas_programador_paginacion.csv' (Total: {len(todos_los_trabajos)} ofertas).")
-else:
-    print("❌ No se encontraron ofertas en ninguna página.")
+class DataExtractor:
+    """
+    Encargado del parseo de HTML y extracción de datos específicos.
+    """
+    @staticmethod
+    def parse_job_offers(html_content):
+        """
+        Recibe HTML y devuelve una lista de ofertas procesadas.
+        """
+        soup = BeautifulSoup(html_content, 'html.parser')
+        raw_offers = soup.find_all('article', class_='box_offer')
+        
+        jobs = []
+        for offer in raw_offers:
+            # Extraer y limpiar datos con fallbacks seguros
+            title = offer.find('h2', class_='fs18')
+            company = offer.find('p', class_='fs16')
+            location = offer.find('span', class_='fs13')
+            
+            job_data = {
+                "Título": title.text.strip() if title else "Sin título",
+                "Empresa": company.text.strip() if company else "Sin empresa",
+                "Ubicación": location.text.strip() if location else "Sin ubicación"
+            }
+            jobs.append(job_data)
+            
+        return jobs
+
+class JobScraperApp:
+    """
+    Clase principal que coordina el flujo de scraping.
+    """
+    def __init__(self, search_url_template):
+        self.scraper = ScraperManager()
+        self.extractor = DataExtractor()
+        self.url_template = search_url_template
+        self.results = []
+
+    def run(self, max_pages=20):
+        logger.info(f"Iniciando proceso de scraping (máximo {max_pages} páginas)...")
+        
+        for p in range(1, max_pages + 1):
+            url = self.url_template.format(page=p)
+            logger.info(f"Procesando página {p}: {url}")
+            
+            try:
+                html = self.scraper.fetch_page(url)
+                
+                if html is None:
+                    logger.info(f"Página {p} no encontrada (404). Deteniendo.")
+                    break
+                
+                page_jobs = self.extractor.parse_job_offers(html)
+                
+                if not page_jobs:
+                    logger.info(f"No hay más ofertas en la página {p}. Deteniendo.")
+                    break
+                
+                # Filtrar BairesDev (mantenido según script original)
+                filtered_jobs = [
+                    {**job, "Página": p} 
+                    for job in page_jobs 
+                    if 'BairesDev' not in job['Empresa']
+                ]
+                
+                self.results.extend(filtered_jobs)
+                logger.info(f"Página {p}: {len(filtered_jobs)} ofertas extraídas.")
+                
+                # Respetar tiempo de espera entre peticiones
+                time.sleep(2)
+                
+            except Exception as e:
+                logger.error(f"Error crítico en página {p}: {e}")
+                continue
+
+        self.save_results()
+
+    def save_results(self, filename='ofertas_refactorizadas.csv'):
+        if self.results:
+            df = pd.DataFrame(self.results)
+            df.to_csv(filename, index=False, encoding='utf-8-sig')
+            logger.info(f"✅ Éxito: {len(self.results)} ofertas guardadas en {filename}")
+        else:
+            logger.error("❌ No se encontraron datos para guardar.")
+
+if __name__ == "__main__":
+    # Template para la búsqueda
+    SEARCH_URL = "https://mx.computrabajo.com/trabajo-de-programador-en-remoto?p={page}"
+    
+    app = JobScraperApp(SEARCH_URL)
+    app.run(max_pages=20)
